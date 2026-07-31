@@ -411,7 +411,7 @@ llama_kv_cache::llama_kv_cache(
 
         map_layer_ids[il] = layers.size();
 
-        layers.push_back({ il, k, v, k_stream, v_stream, });
+        layers.push_back({ il, k, v, nullptr, k_stream, v_stream, {} });
 
         // TurboQuant: create rotation matrix tensors (once, shared across layers)
         if (turbo_rotation == nullptr &&
@@ -2963,4 +2963,82 @@ void llama_kv_cache_context::set_input_k_rot(ggml_tensor * dst) const {
 
 void llama_kv_cache_context::set_input_v_rot(ggml_tensor * dst) const {
     kv->set_input_v_rot(dst);
+}
+
+// ============================================================================
+// FIX-11: STAP3 (poolside/laguna) kv-cache method definitions dropped by the
+// turboquant merge. The merged .cpp kept the surrounding STAP3 streamed
+// (slot_info) kv-cache API (get_k/get_v/cpy_k/cpy_v/get_n_kv, both classes)
+// plus turbo's turbo_rotation/turbo4_0 tensor methods, but dropped exactly
+// these 6: the k_idx indexer views/copies + get_layer_ids + get_k_storage.
+// The STAP3 header (kept by the merge) declares all 6; the .cpp now defines
+// them too. Both logic layers preserved (turbo4_0 logic above untouched).
+//   - the two llama_kv_cache_context:: wrappers are thin forwarders to the
+//     llama_kv_cache:: (slot_info) implementations immediately above them.
+//   - get_k_idx/cpy_k_idx operate on the k_idx indexer tensor (not the quant
+//     K cache) so they do not conflict with turbo4_0 quantization.
+// ============================================================================
+
+std::vector<uint32_t> llama_kv_cache::get_layer_ids() const {
+    std::vector<uint32_t> res;
+    res.reserve(layers.size());
+
+    for (const auto & layer : layers) {
+        res.push_back(layer.il);
+    }
+
+    return res;
+}
+
+ggml_tensor * llama_kv_cache::get_k_storage(int32_t il) const {
+    const int32_t ikv = map_layer_ids.at(il);
+
+    return layers[ikv].k;
+}
+
+ggml_tensor * llama_kv_cache::get_k_idx(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const {
+    const int32_t ikv = map_layer_ids.at(il);
+    auto * k_idx = layers[ikv].k_idx;
+    GGML_ASSERT(k_idx);
+
+    const uint64_t kv_size = get_size();
+    const int64_t  n_idx   = k_idx->ne[0];                 // 128
+    const uint32_t ns      = sinfo.s1 - sinfo.s0 + 1;
+
+    return ggml_view_4d(ctx, k_idx,
+            n_idx, 1, n_kv, ns,
+            ggml_row_size(k_idx->type, n_idx),             // nb1 (single head)
+            ggml_row_size(k_idx->type, n_idx),             // nb2 (per cell)
+            ggml_row_size(k_idx->type, n_idx*kv_size),     // nb3 (per stream)
+            ggml_row_size(k_idx->type, n_idx*kv_size)*sinfo.s0);
+}
+
+ggml_tensor * llama_kv_cache::cpy_k_idx(ggml_context * ctx, ggml_tensor * k_idx_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const {
+    GGML_UNUSED(sinfo);
+    const int32_t ikv = map_layer_ids.at(il);
+    ggml_tensor * k_idx = layers[ikv].k_idx;
+    GGML_ASSERT(k_idx && "cpy_k_idx on a layer with no indexer cache");
+
+    const int64_t n_embd_head = k_idx_cur->ne[0];          // 128
+    const int64_t n_head      = k_idx_cur->ne[1];          // 1
+    const int64_t n_tokens    = k_idx_cur->ne[2];
+    const int64_t n_embd_gqa  = n_embd_head*n_head;        // 128
+
+    GGML_ASSERT(ggml_row_size(k_idx_cur->type, n_embd_head) == k_idx_cur->nb[1]);
+    k_idx_cur = ggml_view_2d(ctx, k_idx_cur, n_embd_gqa, n_tokens, k_idx_cur->nb[2], 0);
+
+    const int64_t n_stream = k_idx->ne[2];
+    if (n_stream > 1) {
+        const int64_t kv_size = get_size();
+        k_idx = ggml_reshape_2d(ctx, k_idx, n_embd_gqa, kv_size*n_stream);
+    }
+    return ggml_set_rows(ctx, k_idx, k_idx_cur, k_idxs);   // same k_idxs as the K store
+}
+
+ggml_tensor * llama_kv_cache_context::get_k_idx(ggml_context * ctx, int32_t il) const {
+    return kv->get_k_idx(ctx, il, n_kv, sinfos[i_cur]);
+}
+
+ggml_tensor * llama_kv_cache_context::cpy_k_idx(ggml_context * ctx, ggml_tensor * k_idx_cur, ggml_tensor * k_idxs, int32_t il) const {
+    return kv->cpy_k_idx(ctx, k_idx_cur, k_idxs, il, sinfos[i_cur]);
 }
