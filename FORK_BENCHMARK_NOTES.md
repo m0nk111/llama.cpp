@@ -37,7 +37,7 @@ turbo4 KV (with fork auto-asymmetric K->q8_0 upgrade at GQA 8:1) beats q4_0 KV
 by ~11% on decode at equal prompt speed. No quality anomalies observed in
 benchmark outputs. This is now the production KV type for this model.
 
-### Finding 3: vision mode does not need a low `ngl` to fit the mmproj
+## Artifacts
 
 The mmproj vision tower offloads independently (`mmproj_use_gpu`, on by
 default) and does not consume the text model's `-ngl` budget. The old habit of
@@ -51,6 +51,27 @@ Caveat: the equal split `0.38,0.62` loads fine but **segfaults on the first
 vision request** (GPU0 compute-buffer OOM, 248 MiB short). Leave >= 1 GB
 headroom on the smaller GPU for the vision compute buffer; the mmproj warmup
 at load time does not exercise this, only a real image request does.
+
+### Finding 4: ctx beyond `n_ctx_train` needs a server patch + smaller batch
+
+Upstream llama-server hard-caps per-slot context at the model's training
+context (`server-context.cpp`: "the slot context exceeds the training context
+of the model - capping"), which silently nullifies `-c` above `n_ctx_train`
+even when rope scaling is configured. This fork now skips that cap when
+`rope_scaling_type` is set (yarn-ctx graft).
+
+Qwen3.6-35B at `-c 393216` (1.5x native) + YaRN 1.5x on this host:
+
+- 292,959-token needle-in-haystack: PASS (811 tok/s prefill, 17.2 tok/s decode
+  at ~293k depth, needle found verbatim).
+- Requires `--batch-size 1024 --ubatch-size 256`: at default 2048/512 the
+  1.6 GB compute buffer fails to allocate on GPU1 and the server falls back
+  to non-pipelined execution. Note the failure is recoverable-from — the
+  server still reports healthy — so check logs for "compute buffer allocation
+  failed" after any ctx bump.
+- `rope.freq_base = 10^7` on this model family makes YaRN quality loss at
+  1.5x negligible for retrieval tasks; generative quality beyond 262144 is
+  not yet characterized.
 
 ## Artifacts
 
